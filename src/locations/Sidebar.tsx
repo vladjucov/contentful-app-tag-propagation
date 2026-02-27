@@ -322,7 +322,8 @@ async function traverseDescendants(
   locale: string,
   config: InstallConfig,
   rootEntryIds: string[],
-  targetTagIds: string[]
+  targetTagIds: string[],
+  activeLocationIds: string[]
 ): Promise<ScanSummary> {
   const visitedEntries = new Set<string>();
   const visitedAssets = new Set<string>();
@@ -332,6 +333,14 @@ async function traverseDescendants(
 
   type QItem = { type: 'Entry'; id: string; depth: number };
   const queue: QItem[] = rootEntryIds.map((id) => ({ type: 'Entry', id, depth: 0 }));
+
+  // If the location ID itself wasn't in root pages, we still want to add it to the queue
+  // so that fields INSIDE the location are scanned.
+  for (const id of activeLocationIds) {
+    if (!rootEntryIds.includes(id)) {
+      queue.push({ type: 'Entry', id, depth: 0 });
+    }
+  }
 
   while (queue.length) {
     const batch = queue.splice(0, Math.max(1, config.requestConcurrency));
@@ -348,19 +357,32 @@ async function traverseDescendants(
         });
 
         const ct = (entry as any)?.sys?.contentType?.sys?.id ?? 'unknown';
+
         const isExcludedCt = config.excludedContentTypes.includes(ct);
-        const isLocationCt = ct === 'location';
-        const excluded = isExcludedCt || isLocationCt;
-        const excludedReason: EntryScanRow['excludedReason'] = isLocationCt
+
+        const isInitialRootLocation = ct === 'location' && activeLocationIds.includes(id);
+        const isOtherLocation = ct === 'location' && !isInitialRootLocation;
+
+        const isRootCt = config.rootContentTypes.includes(ct);
+        const isInitialRootPage = isRootCt && rootEntryIds.includes(id);
+        const isOtherRootPage = isRootCt && !isInitialRootPage;
+
+        const excluded = isExcludedCt || isOtherLocation || isOtherRootPage;
+        const excludedReason: EntryScanRow['excludedReason'] = isOtherLocation
           ? 'location'
-          : isExcludedCt
-            ? 'excludedContentType'
-            : undefined;
+          : isOtherRootPage
+            ? 'excludedContentType' // We'll label other root pages as excludedContentType in UI for now
+            : isExcludedCt
+              ? 'excludedContentType'
+              : undefined;
         const title = getEntryTitle(entry, locale);
 
         const existing = getTagIdsFromMetadata(entry);
         const missing = targetTagIds.filter((t) => !existing.includes(t));
 
+        // Note: we don't even want OTHER locations to show up as taggable, so we mark them excluded.
+        // However, if we want them out of the list completely we could just return here.
+        // But adding them as 'excluded' shows the user we hit a boundary, which is nice.
         entryRows.set(id, {
           kind: 'Entry',
           id,
@@ -530,17 +552,17 @@ const Sidebar = () => {
       setScanStatus('Resolving target tags…');
 
       const { tagIds, missing } = await resolveTargetTagIds(
-          sdk,
-          config.tagMatchMode,
-          ctx.locationTags,
-          tagNameCache
+        sdk,
+        config.tagMatchMode,
+        ctx.locationTags,
+        tagNameCache
       );
 
       if (!tagIds.length) {
         setScanStatus(
-            missing.length
-                ? `No matching Contentful Tag found for: ${missing.join(', ')}`
-                : 'No target tag IDs resolved.'
+          missing.length
+            ? `No matching Contentful Tag found for: ${missing.join(', ')}`
+            : 'No target tag IDs resolved.'
         );
         return;
       }
@@ -561,7 +583,7 @@ const Sidebar = () => {
 
         setScanStatus('Scanning descendants…');
 
-        const summary = await traverseDescendants(sdk, locale, config, roots, tagIds);
+        const summary = await traverseDescendants(sdk, locale, config, roots, tagIds, ctx.locationIds);
         summary.missingTargetTagsByName = missing;
 
         setScanSummary(summary);
@@ -597,7 +619,9 @@ const Sidebar = () => {
 
       setScanStatus('Scanning descendants…');
 
-      const summary = await traverseDescendants(sdk, locale, config, roots, tagIds);
+      // We pass the ctx.locationIds directly into traverseDescendants to ensure these Location nodes
+      // are scanned, and not mistakenly excluded as "other locations".
+      const summary = await traverseDescendants(sdk, locale, config, roots, tagIds, ctx.locationIds);
       summary.missingTargetTagsByName = missing;
 
       setScanSummary(summary);
@@ -613,22 +637,22 @@ const Sidebar = () => {
 
 
   const openDetailsDialog = async (
-      summary: ScanSummary,
-      missingTargetTagsByName: string[],
-      breakdown: Record<string, number>,
-      locationTagNames: string[],
-      resolvedTargetTagIds: string[]
+    summary: ScanSummary,
+    missingTargetTagsByName: string[],
+    breakdown: Record<string, number>,
+    locationTagNames: string[],
+    resolvedTargetTagIds: string[]
   ) => {
     const uniqNames = Array.from(new Set(locationTagNames.filter(Boolean)));
     const resolvedByName = tagNameCache.current;
 
     const targetTags =
-        config.tagMatchMode === 'id'
-            ? resolvedTargetTagIds.map((id) => ({ id, name: id }))
-            : uniqNames
-                .map((name) => ({ name, id: resolvedByName?.get(name) }))
-                .filter((t): t is { name: string; id: string } => typeof t.id === 'string' && t.id.length > 0)
-                .filter((t) => resolvedTargetTagIds.includes(t.id));
+      config.tagMatchMode === 'id'
+        ? resolvedTargetTagIds.map((id) => ({ id, name: id }))
+        : uniqNames
+          .map((name) => ({ name, id: resolvedByName?.get(name) }))
+          .filter((t): t is { name: string; id: string } => typeof t.id === 'string' && t.id.length > 0)
+          .filter((t) => resolvedTargetTagIds.includes(t.id));
 
     const contentRows = (() => {
       const seen = new Set<string>();

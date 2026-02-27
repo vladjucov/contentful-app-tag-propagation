@@ -16,6 +16,7 @@ import {
   Tooltip,
   Switch,
   Skeleton,
+  TextLink,
 } from '@contentful/f36-components';
 import type { DialogAppSDK } from '@contentful/app-sdk';
 import { useSDK } from '@contentful/react-apps-toolkit';
@@ -57,9 +58,9 @@ function makeTagLink(id: string) {
 }
 
 async function promisePool<T>(
-    items: T[],
-    concurrency: number,
-    worker: (item: T) => Promise<void>
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<void>
 ): Promise<void> {
   let idx = 0;
   const runners = new Array(Math.max(1, concurrency)).fill(0).map(async () => {
@@ -71,8 +72,17 @@ async function promisePool<T>(
   await Promise.all(runners);
 }
 
-function renderStatusBadge(status: 'excluded' | 'published' | 'draft', label: string) {
-  const variant = status === 'excluded' ? 'negative' : status === 'published' ? 'positive' : 'neutral';
+type EntityStatus = 'excluded' | 'published' | 'changed' | 'draft';
+
+function renderStatusBadge(status: EntityStatus, label: string) {
+  const variant =
+    status === 'published'
+      ? 'positive'
+      : status === 'changed'
+        ? 'primary'
+        : status === 'draft'
+          ? 'warning'
+          : 'featured';
   return <Badge variant={variant as any}>{label}</Badge>;
 }
 
@@ -84,12 +94,12 @@ const Dialog = () => {
 
   if ((params as any)?.mode !== 'details') {
     return (
-        <Stack flexDirection="column" spacing="spacingM" padding="spacingM">
-          <Note variant="warning">No dialog parameters provided.</Note>
-          <Button variant="secondary" onClick={close}>
-            Close
-          </Button>
-        </Stack>
+      <Stack flexDirection="column" spacing="spacingM" padding="spacingM">
+        <Note variant="warning">No dialog parameters provided.</Note>
+        <Button variant="secondary" onClick={close}>
+          Close
+        </Button>
+      </Stack>
     );
   }
 
@@ -112,15 +122,23 @@ const Dialog = () => {
 
   const [mediaPreviewById, setMediaPreviewById] = useState<Record<string, string>>({});
 
-  const [publishedEntryById, setPublishedEntryById] = useState<Record<string, boolean>>({});
-  const [publishedAssetById, setPublishedAssetById] = useState<Record<string, boolean>>({});
+  const [statusEntryById, setStatusEntryById] = useState<Record<string, EntityStatus>>({});
+  const [statusAssetById, setStatusAssetById] = useState<Record<string, EntityStatus>>({});
 
   const StatusSkeleton = () => (
-      <div style={{ width: 96, height: 24, display: 'inline-block' }}>
-        <Skeleton.Container>
-          <Skeleton.Image width={96} height={24} radiusX={6} radiusY={6} />
-        </Skeleton.Container>
-      </div>
+    <div style={{ width: 96, height: 24, display: 'inline-block' }}>
+      <Skeleton.Container>
+        <Skeleton.Image width={96} height={24} radiusX={6} radiusY={6} />
+      </Skeleton.Container>
+    </div>
+  );
+
+  const ImageSkeleton = () => (
+    <div style={{ width: 40, height: 40, display: 'inline-block' }}>
+      <Skeleton.Container>
+        <Skeleton.Image width={40} height={40} radiusX={6} radiusY={6} />
+      </Skeleton.Container>
+    </div>
   );
 
   // Load a small set of media previews (and also published status for those assets)
@@ -131,10 +149,10 @@ const Dialog = () => {
       // load at most first 25 previews to keep it fast
       const ids = actionableMediaRows.slice(0, 25).map((r) => r.id).filter(Boolean);
       const next: Record<string, string> = {};
-      const nextPublished: Record<string, boolean> = {};
+      const nextPublished: Record<string, EntityStatus> = {};
 
       for (const assetId of ids) {
-        if (mediaPreviewById[assetId] && publishedAssetById[assetId] !== undefined) continue;
+        if (mediaPreviewById[assetId] && statusAssetById[assetId] !== undefined) continue;
         try {
           const asset = await sdk.cma.asset.get({
             spaceId: sdk.ids.space,
@@ -142,14 +160,21 @@ const Dialog = () => {
             assetId,
           });
 
-          nextPublished[assetId] = Boolean((asset as any)?.sys?.publishedVersion);
+          const sys = (asset as any)?.sys;
+          const st: EntityStatus =
+            !sys?.publishedVersion
+              ? 'draft'
+              : typeof sys?.version === 'number' && sys.version === sys.publishedVersion + 1
+                ? 'published'
+                : 'changed';
+          nextPublished[assetId] = st;
 
           const file = (asset as any)?.fields?.file;
           // Try common locales, otherwise first locale.
           const fileVal = (file && (file[sdk.locales.default] ?? file[Object.keys(file)[0]])) || undefined;
           const url = fileVal?.url;
           if (typeof url === 'string' && url.length) {
-            next[assetId] = url.startsWith('//') ? `https:${url}` : url;
+            next[assetId] = url.startsWith('//') ? `https:${url}?w=40&h=40&fit=thumb` : `${url}?w=40&h=40&fit=thumb`;
           }
         } catch {
           // ignore
@@ -161,7 +186,7 @@ const Dialog = () => {
           setMediaPreviewById((prev) => ({ ...prev, ...next }));
         }
         if (Object.keys(nextPublished).length) {
-          setPublishedAssetById((prev) => ({ ...prev, ...nextPublished }));
+          setStatusAssetById((prev) => ({ ...prev, ...nextPublished }));
         }
       }
     };
@@ -179,25 +204,31 @@ const Dialog = () => {
 
     const load = async () => {
       const ids = actionableMediaRows.slice(0, 250).map((r) => r.id).filter(Boolean);
-      const next: Record<string, boolean> = {};
+      const next: Record<string, EntityStatus> = {};
       const concurrency = 6;
 
       await promisePool(ids, concurrency, async (assetId) => {
-        if (publishedAssetById[assetId] !== undefined) return;
+        if (statusAssetById[assetId] !== undefined) return;
         try {
           const asset = await sdk.cma.asset.get({
             spaceId: sdk.ids.space,
             environmentId: sdk.ids.environment,
             assetId,
           });
-          next[assetId] = Boolean((asset as any)?.sys?.publishedVersion);
+          const sys = (asset as any)?.sys;
+          next[assetId] =
+            !sys?.publishedVersion
+              ? 'draft'
+              : typeof sys?.version === 'number' && sys.version === sys.publishedVersion + 1
+                ? 'published'
+                : 'changed';
         } catch {
           // ignore
         }
       });
 
       if (!cancelled && Object.keys(next).length) {
-        setPublishedAssetById((prev) => ({ ...prev, ...next }));
+        setStatusAssetById((prev) => ({ ...prev, ...next }));
       }
     };
 
@@ -213,7 +244,7 @@ const Dialog = () => {
 
     const load = async () => {
       const ids = actionableContentRows.slice(0, 250).map((r) => r.id).filter(Boolean);
-      const next: Record<string, boolean> = {};
+      const next: Record<string, EntityStatus> = {};
       const concurrency = 6;
 
       let idx = 0;
@@ -221,7 +252,7 @@ const Dialog = () => {
         while (idx < ids.length) {
           const myIdx = idx++;
           const entryId = ids[myIdx];
-          if (publishedEntryById[entryId] !== undefined) continue;
+          if (statusEntryById[entryId] !== undefined) continue;
 
           try {
             const entry = await sdk.cma.entry.get({
@@ -230,7 +261,13 @@ const Dialog = () => {
               entryId,
             });
 
-            next[entryId] = Boolean((entry as any)?.sys?.publishedVersion);
+            const sys = (entry as any)?.sys;
+            next[entryId] =
+              !sys?.publishedVersion
+                ? 'draft'
+                : typeof sys?.version === 'number' && sys.version === sys.publishedVersion + 1
+                  ? 'published'
+                  : 'changed';
           } catch {
             // ignore
           }
@@ -240,7 +277,7 @@ const Dialog = () => {
       await Promise.all(runners);
 
       if (!cancelled && Object.keys(next).length) {
-        setPublishedEntryById((prev) => ({ ...prev, ...next }));
+        setStatusEntryById((prev) => ({ ...prev, ...next }));
       }
     };
 
@@ -269,8 +306,22 @@ const Dialog = () => {
   const [applyDone, setApplyDone] = useState(false);
 
   type ApplySummary = {
-    entries: { selected: number; updated: number; republished: number; skippedExcluded: number; skippedAlreadyOk: number; failed: number };
-    assets: { selected: number; updated: number; republished: number; skippedExcluded: number; skippedAlreadyOk: number; failed: number };
+    entries: {
+      selected: number;
+      updated: number;
+      republished: number;
+      skippedExcluded: number;
+      skippedAlreadyOk: number;
+      failed: number;
+    };
+    assets: {
+      selected: number;
+      updated: number;
+      republished: number;
+      skippedExcluded: number;
+      skippedAlreadyOk: number;
+      failed: number;
+    };
   };
 
   const [applySummary, setApplySummary] = useState<ApplySummary | null>(null);
@@ -285,7 +336,7 @@ const Dialog = () => {
   );
 
   const toggleId = (list: string[], id: string) =>
-      list.includes(id) ? list.filter((x) => x !== id) : [...list, id];
+    list.includes(id) ? list.filter((x) => x !== id) : [...list, id];
 
   const onApply = async () => {
     setApplyError('');
@@ -373,7 +424,10 @@ const Dialog = () => {
             for (const tagId of p.targetTagIds) {
               if (!existingIds.includes(tagId)) mergedLinks.push(makeTagLink(tagId));
             }
-            const wasPublished = Boolean((entry as any)?.sys?.publishedVersion);
+            const sys = (entry as any)?.sys;
+            const isCurrentlyPublished =
+              Boolean(sys?.publishedVersion) && typeof sys?.version === 'number' && sys.version === sys.publishedVersion + 1;
+
             const updated = await sdk.cma.entry.update(
               { spaceId: sdk.ids.space, environmentId: sdk.ids.environment, entryId },
               {
@@ -382,7 +436,9 @@ const Dialog = () => {
               } as any
             );
             summary.entries.updated += 1;
-            if (preservePublishState && wasPublished) {
+
+            // Republish ONLY if the item was fully Published (not “Changed”) before we updated metadata.
+            if (preservePublishState && isCurrentlyPublished) {
               await sdk.cma.entry.publish(
                 { spaceId: sdk.ids.space, environmentId: sdk.ids.environment, entryId },
                 updated as any
@@ -390,6 +446,7 @@ const Dialog = () => {
               summary.entries.republished += 1;
             }
           } catch {
+            // Update failed
             summary.entries.failed += 1;
           } finally {
             entryProcessed += 1;
@@ -420,7 +477,10 @@ const Dialog = () => {
             for (const tagId of p.targetTagIds) {
               if (!existingIds.includes(tagId)) mergedLinks.push(makeTagLink(tagId));
             }
-            const wasPublished = Boolean((asset as any)?.sys?.publishedVersion);
+            const sys = (asset as any)?.sys;
+            const isCurrentlyPublished =
+              Boolean(sys?.publishedVersion) && typeof sys?.version === 'number' && sys.version === sys.publishedVersion + 1;
+
             const updated = await sdk.cma.asset.update(
               { spaceId: sdk.ids.space, environmentId: sdk.ids.environment, assetId },
               {
@@ -429,7 +489,9 @@ const Dialog = () => {
               } as any
             );
             summary.assets.updated += 1;
-            if (preservePublishState && wasPublished) {
+
+            // Republish ONLY if the item was fully Published (not “Changed”) before we updated metadata.
+            if (preservePublishState && isCurrentlyPublished) {
               await sdk.cma.asset.publish(
                 { spaceId: sdk.ids.space, environmentId: sdk.ids.environment, assetId },
                 updated as any
@@ -450,6 +512,7 @@ const Dialog = () => {
       setApplyDone(true);
 
       const failed = summary.entries.failed + summary.assets.failed;
+
       if (failed > 0) {
         await Notification.error(`Tags applied with ${failed} error(s). Review the summary for details.`);
       } else {
@@ -465,11 +528,11 @@ const Dialog = () => {
   };
 
   return (
-    <Stack
+    <Flex
       flexDirection="column"
-      spacing="spacingM"
+      gap="spacingM"
       padding="spacingM"
-      style={{ width: '100%', maxWidth: '100%' }}
+      style={{ width: '100%', maxWidth: '100%', height: '100%' }}
     >
       {p.missingTargetTagsByName?.length ? (
         <Note variant="warning">
@@ -544,15 +607,17 @@ const Dialog = () => {
                   actionableContentRows.map((r) => {
                     const disabled = r.excluded || isApplying;
                     const checked = selectedContentIds.includes(r.id);
-                    const publishedVal = publishedEntryById[r.id];
+                    const statusVal = statusEntryById[r.id];
 
                     const statusNode = r.excluded
                       ? renderStatusBadge('excluded', 'Excluded')
-                      : publishedVal === undefined
+                      : statusVal === undefined
                         ? <StatusSkeleton />
-                        : publishedVal
+                        : statusVal === 'published'
                           ? renderStatusBadge('published', 'Published')
-                          : renderStatusBadge('draft', 'Not published');
+                          : statusVal === 'changed'
+                            ? renderStatusBadge('changed', 'Changed')
+                            : renderStatusBadge('draft', 'Draft');
 
                     return (
                       <TableRow key={r.id}>
@@ -565,7 +630,13 @@ const Dialog = () => {
                         </TableCell>
                         <TableCell>
                           <Tooltip content={`Type: ${r.contentType}`}>
-                            <Text>{r.title}</Text>
+                            <TextLink
+                              href={`https://app.contentful.com/spaces/${sdk.ids.space}/environments/${sdk.ids.environment}/entries/${r.id}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                            >
+                              {r.title}
+                            </TextLink>
                           </Tooltip>
                         </TableCell>
                         <TableCell>{statusNode}</TableCell>
@@ -622,15 +693,17 @@ const Dialog = () => {
                   actionableMediaRows.map((r) => {
                     const disabled = r.excluded || isApplying;
                     const checked = selectedMediaIds.includes(r.id);
-                    const publishedVal = publishedAssetById[r.id];
+                    const statusVal = statusAssetById[r.id];
 
                     const statusNode = r.excluded
                       ? renderStatusBadge('excluded', 'Excluded')
-                      : publishedVal === undefined
+                      : statusVal === undefined
                         ? <StatusSkeleton />
-                        : publishedVal
+                        : statusVal === 'published'
                           ? renderStatusBadge('published', 'Published')
-                          : renderStatusBadge('draft', 'Not published');
+                          : statusVal === 'changed'
+                            ? renderStatusBadge('changed', 'Changed')
+                            : renderStatusBadge('draft', 'Draft');
 
                     return (
                       <TableRow key={r.id}>
@@ -649,10 +722,18 @@ const Dialog = () => {
                               style={{ width: 40, height: 40, objectFit: 'cover', borderRadius: 4 }}
                             />
                           ) : (
-                            <Text fontColor="gray600" fontSize="fontSizeS">—</Text>
+                            <ImageSkeleton />
                           )}
                         </TableCell>
-                        <TableCell>{r.title}</TableCell>
+                        <TableCell>
+                          <TextLink
+                            href={`https://app.contentful.com/spaces/${sdk.ids.space}/environments/${sdk.ids.environment}/assets/${r.id}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                          >
+                            {r.title}
+                          </TextLink>
+                        </TableCell>
                         <TableCell>{statusNode}</TableCell>
                       </TableRow>
                     );
@@ -669,10 +750,10 @@ const Dialog = () => {
         <Note variant="positive" title="Apply complete">
           <Stack flexDirection="column" spacing="spacingXs">
             <Text>
-              Content: updated {applySummary.entries.updated}/{applySummary.entries.selected}, republished {applySummary.entries.republished}, skipped (excluded {applySummary.entries.skippedExcluded}, already ok {applySummary.entries.skippedAlreadyOk}), failed {applySummary.entries.failed}.
+              Content: updated {applySummary.entries.updated}/{applySummary.entries.selected}, republished {applySummary.entries.republished}, skipped (excluded {applySummary.entries.skippedExcluded}, already ok {applySummary.entries.skippedAlreadyOk}), update failed {applySummary.entries.failed}.
             </Text>
             <Text>
-              Media: updated {applySummary.assets.updated}/{applySummary.assets.selected}, republished {applySummary.assets.republished}, skipped (excluded {applySummary.assets.skippedExcluded}, already ok {applySummary.assets.skippedAlreadyOk}), failed {applySummary.assets.failed}.
+              Media: updated {applySummary.assets.updated}/{applySummary.assets.selected}, republished {applySummary.assets.republished}, skipped (excluded {applySummary.assets.skippedExcluded}, already ok {applySummary.assets.skippedAlreadyOk}), update failed {applySummary.assets.failed}.
             </Text>
           </Stack>
         </Note>
@@ -683,46 +764,68 @@ const Dialog = () => {
         </Note>
       ) : null}
 
-      <Flex justifyContent="space-between" alignItems="flex-end" style={{ width: '100%' }}>
-        <Stack flexDirection="column" spacing="spacing2Xs" style={{ maxWidth: 520 }}>
-          {hasAnythingToApply && !applyDone ? (
-            <>
-              <Switch
-                id="preserve-publish-state"
-                isChecked={preservePublishState}
-                onChange={() => setPreservePublishState((v) => !v)}
-              >
-                Preserve publish state
-              </Switch>
-              <Text fontColor="gray600" fontSize="fontSizeS">
-                If enabled, items that were published before will be republished after tags are added.
-              </Text>
-            </>
-          ) : null}
-        </Stack>
+      <div
+        style={{
+          marginTop: 'auto',
+          position: 'sticky',
+          bottom: 0,
+          background: 'white',
+          borderTop: '1px solid #e5ebed',
+          paddingTop: 12,
+          paddingBottom: 8,
+          width: '100%',
+        }}
+      >
+        <Flex justifyContent="space-between" alignItems="flex-start" style={{ width: '100%' }}>
+          <Stack flexDirection="column" spacing="spacing2Xs" style={{ maxWidth: 520 }} alignItems="start">
+            {hasAnythingToApply && !applyDone ? (
+              <>
+                <Switch
+                  id="preserve-publish-state"
+                  isChecked={preservePublishState}
+                  onChange={() => setPreservePublishState((v) => !v)}
+                >
+                  Preserve publish state
+                </Switch>
+                <Text
+                  fontColor="gray600"
+                  fontSize="fontSizeS"
+                  style={{
+                    display: '-webkit-box',
+                    WebkitLineClamp: 2,
+                    WebkitBoxOrient: 'vertical',
+                    overflow: 'hidden',
+                  }}
+                >
+                  If enabled, items that were published before will be republished after tags are added.
+                </Text>
+              </>
+            ) : null}
+          </Stack>
 
-        <Stack flexDirection="row" spacing="spacingS" justifyContent="flex-end">
-          {!hasAnythingToApply ? (
-            <Button variant="primary" onClick={close}>
-              Close
-            </Button>
-          ) : applyDone ? (
-            <Button variant="primary" onClick={close}>
-              Close
-            </Button>
-          ) : (
-            <>
-              <Button variant="secondary" isDisabled={isApplying} onClick={close}>
-                Cancel
+          <Stack flexDirection="row" spacing="spacingS" justifyContent="flex-end" alignItems="center">
+            {!hasAnythingToApply ? (
+              <Button variant="primary" onClick={close}>
+                Close
               </Button>
-              <Button variant="primary" isDisabled={isApplying} isLoading={isApplying} onClick={onApply}>
-                Apply tags
+            ) : applyDone ? (
+              <Button variant="primary" onClick={close}>
+                Close
               </Button>
-            </>
-          )}
-        </Stack>
-      </Flex>
-    </Stack>
+            ) : (
+              <>
+                <Button variant="secondary" isDisabled={isApplying} onClick={close}>
+                  Cancel
+                </Button>
+                <Button variant="primary" isDisabled={isApplying} isLoading={isApplying} onClick={onApply}>
+                  Apply tags
+                </Button>
+              </>
+            )}
+          </Stack>
+        </Flex>
+      </div>
+    </Flex>
   );
 };
 
